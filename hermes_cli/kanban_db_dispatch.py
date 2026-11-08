@@ -2127,9 +2127,10 @@ def _dispatch_lane_task(
     if claimed is None:
         return False
     try:
-        resolved_branch_name = None
         if claimed.workspace_kind == "worktree":
-            workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
+            workspace, _resolved_branch_name = _kbw.resolve_and_record_worktree_branch(
+                conn, claimed, board=board
+            )
         else:
             workspace = _kbw.resolve_workspace(claimed, board=board)
     except Exception as exc:
@@ -2140,8 +2141,6 @@ def _dispatch_lane_task(
             result.auto_blocked.append(claimed.id)
         return False
     _kbw.set_workspace_path(conn, claimed.id, str(workspace))
-    if claimed.workspace_kind == "worktree":
-        _kbw.set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
     _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
     if lane == "review":
         # Force-load sdlc-review; the kanban lifecycle is already in every

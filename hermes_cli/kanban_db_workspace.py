@@ -14,6 +14,7 @@ import subprocess
 import time
 import unicodedata
 from pathlib import Path
+from typing import Any
 from typing import Optional
 from typing import TYPE_CHECKING
 import contextlib
@@ -836,6 +837,70 @@ def set_workspace_path(conn: sqlite3.Connection, task_id: str, path: Path | str)
 
 def set_branch_name(conn: sqlite3.Connection, task_id: str, branch_name: str) -> None:
     _set_task_column(conn, task_id, "branch_name", str(branch_name))
+
+
+def refresh_task_branch_name(conn: sqlite3.Connection, task: Any) -> Optional[str]:
+    """Re-read ``task.branch_name`` from the row and return the current value.
+
+    A task row's ``branch_name`` has two independent writers: the dispatcher
+    (which derives ``wt/<task-id>`` for a worktree task that carries no branch)
+    and any caller that sets a conventional branch on the row afterwards -- an
+    orchestrator stamping ``worktrees/fix/<slug>`` onto a freshly created card,
+    or a CLI caller using ``kanban create --branch``.
+
+    The dispatcher used to read the branch from the task snapshot taken at
+    CLAIM time and materialise the worktree on that value. If the other writer
+    set the branch between the claim and the resolution, the snapshot was
+    stale: the worktree was created on the derived fallback and the row was
+    then written back with it, silently discarding the branch the caller had
+    asked for and leaving the row describing a branch that no checkout uses.
+    Anything matching ``task.branch_name`` against a PR head ref then fails to
+    find an owner.
+
+    Re-reading here keeps the row and the worktree in lockstep: the worktree is
+    created on the branch the row currently names, and the dispatcher persists
+    that same value. The task object is updated in place so the caller sees
+    the fresh value too.
+
+    Returns the current branch name, or None when the row is gone.
+    """
+    row = conn.execute(
+        "SELECT branch_name FROM tasks WHERE id = ?", (task.id,)
+    ).fetchone()
+    if row is None:
+        return None
+    task.branch_name = row["branch_name"]
+    return task.branch_name
+
+
+def resolve_and_record_worktree_branch(
+    conn: sqlite3.Connection,
+    task: Any,
+    *,
+    board: Optional[str] = None,
+) -> tuple[Path, str]:
+    """Resolve a worktree task's workspace and record the branch it landed on.
+
+    This is the single place that decides which branch a worktree task uses.
+    It refreshes the task's branch from the row first (the claim-time snapshot
+    can be stale -- see ``refresh_task_branch_name``), resolves the worktree on
+    that branch, and then persists the resolved branch so the row always
+    describes the checkout that exists.
+
+    The persisted value must equal the branch the worktree actually uses --
+    otherwise the row describes a branch no checkout is on, and anything that
+    matches ``task.branch_name`` against a PR head ref cannot find an owner.
+    The write is therefore unconditional; the staleness that made this racy is
+    handled by the refresh above, not by guarding the write.
+    """
+    refresh_task_branch_name(conn, task)
+    workspace, resolved = _resolve_worktree_workspace(task, board=board)
+    set_branch_name(
+        conn,
+        task.id,
+        resolved or (task.branch_name or "").strip() or f"wt/{task.id}",
+    )
+    return workspace, resolved
 
 
 # Late-bound origin namespace (see module docstring); imported LAST so this
