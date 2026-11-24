@@ -683,6 +683,10 @@ class WebhookAdapter(BasePlatformAdapter):
             raw_body, error_response = await self._read_authenticated_body(request, route_name, route_config)
         if error_response is not None:
             return error_response
+        # _resolve_route pairs route_config=None exactly with a non-None error_response,
+        # so a live request past this point always has a config; the assert teaches
+        # checkers that narrowing (it also covers the render/dispatch calls below).
+        assert route_config is not None
         headers = request.headers
         delivery_id = _header_delivery_id(headers)
         # A parked profile is retried, before any delivery id is recorded. The check resolves
@@ -713,20 +717,17 @@ class WebhookAdapter(BasePlatformAdapter):
         if not self._route_processor.route_filters_match(route_config, payload, event_type, request.headers):
             logger.info("[webhook] filtered event=%s route=%s", event_type, route_name)
             return web.json_response({"status": "ignored", "reason": "filter", "route": route_name})
+        # Script routes (e.g. gh-factory) must not hold GitHub's delivery clock while a
+        # subprocess (state machine, gh, Discord, up to script_timeout_seconds) runs: auth,
+        # parse and cheap filter matching already passed above, so record the delivery id,
+        # hand the slow work to a tracked background task, and ack 202 immediately.
+        if route_config.get("script"):
+            return self._accept_script_route(payload, route_config, route_name, profile, event_type,
+                                             delivery_id)
         # Script, prompt render and skill lookup read the profile's home (skills/, config); the runner
         # only enters the routed profile's scope later around handle_message, so enter it here.
         # See #67277.
         with self._profile_scope(profile):
-            script = route_config.get("script")
-            if script:
-                # Shells out (up to its timeout) — worker thread so the loop isn't blocked; to_thread
-                # copies contextvars so the profile scope follows.
-                keep, transformed_payload = await asyncio.to_thread(
-                    self._route_processor.run_route_script, script, payload)
-                if not keep:
-                    logger.info("[webhook] script ignored event=%s route=%s", event_type, route_name)
-                    return web.json_response({"status": "ignored", "reason": "script", "route": route_name})
-                payload = transformed_payload or payload
             prompt = (render_mcp_event_prompt(self, route_config, payload, event_type, route_name)
                       or self._render_prompt(route_config.get("prompt", ""), payload, event_type, route_name))
             # cron_job routes: the job's own skills apply; the rendered prompt is only per-run context.
@@ -755,6 +756,100 @@ class WebhookAdapter(BasePlatformAdapter):
                                       "delivery_id": delivery_id}, status=202)
         return await self._dispatch_agent_run(request, route_config, route_name, profile, payload, prompt, event_type,
                                         delivery_id, now)
+
+    def _accept_script_route(self, payload: Any, route_config: dict, route_name: str, profile,
+                             event_type: str, delivery_id: str) -> web.Response:
+        """Ack a script route with 202 before the slow route script runs.
+
+        Auth, parsing, and cheap filter matching already passed on the request path; the
+        delivery id is recorded here so a provider retry is answered ``duplicate`` instead of
+        starting the script twice. The script (subprocess, still bounded by
+        ``script_timeout_seconds``) plus prompt render and dispatch continue in a tracked
+        background task — the same ``create_task`` + ``_background_tasks`` + ``discard``
+        pattern ``_handle_cron_trigger`` uses, so the task is not garbage-collected and
+        ``cancel_background_tasks`` still drains it on shutdown. A worker crash loses only
+        the in-memory record; the gh-factory ``factory-review-reconciler.timer`` recovers
+        missed verdicts (delay, not drop). No new queue."""
+        now = time.time()
+        identity = _WebhookDeliveryIdentity.from_parts(profile, route_name, delivery_id)
+        if not self._record_delivery_id(identity, now):
+            logger.info("[webhook] Skipping duplicate delivery %s on route %s", delivery_id, route_name)
+            return web.json_response({"status": "duplicate", "delivery_id": delivery_id}, status=200)
+        task = asyncio.create_task(
+            self._run_script_route(payload, route_config, route_name, profile, event_type, delivery_id,
+                                   now))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return web.json_response({"status": "accepted", "route": route_name, "event": event_type,
+                                  "delivery_id": delivery_id}, status=202)
+
+    async def _run_script_route(self, payload: Any, route_config: dict, route_name: str, profile,
+                                event_type: str, delivery_id: str, now: float) -> None:
+        """Background worker for a 202-acked script route: script, then the normal dispatch tail.
+
+        Mirrors the pre-ack ordering (script veto → prompt render → skills → cron_job /
+        deliver_only / coalesce / agent admission). Script vetoes, admission outcomes, and
+        failures are logged with route + delivery id since there is no response left to
+        report them in; unexpected exceptions are captured here and never reach the request.
+        ``asyncio.CancelledError`` is re-raised so shutdown cancellation keeps working."""
+        try:
+            script = route_config.get("script")
+            with self._profile_scope(profile):
+                # Shells out (up to its timeout) — worker thread so the loop isn't blocked;
+                # to_thread copies contextvars so the profile scope follows. This await lives
+                # in the tracked background task, never on the request path.
+                run_script = self._route_processor.run_route_script
+                keep, transformed = await asyncio.to_thread(run_script, script, payload)
+            if not keep:
+                logger.info("[webhook] script ignored event=%s route=%s delivery=%s", event_type,
+                            route_name, delivery_id)
+                return
+            payload = transformed or payload
+            with self._profile_scope(profile):
+                prompt = (render_mcp_event_prompt(self, route_config, payload, event_type, route_name)
+                          or self._render_prompt(route_config.get("prompt", ""), payload, event_type,
+                                                 route_name))
+                # cron_job routes: the job's own skills apply; the rendered prompt is only per-run context.
+                if (skills := route_config.get("skills", [])) and not route_config.get("cron_job"):
+                    prompt = self._apply_skills(prompt, skills)
+            if route_config.get("cron_job"):
+                self._handle_cron_trigger(prompt, route_config, route_name, event_type, delivery_id,
+                                          profile)
+                return
+            if route_config.get("deliver_only"):
+                response = await self._handle_deliver_only(prompt, payload, route_config, route_name,
+                                                           event_type, delivery_id, profile)
+                logger.info("[webhook] script-route direct-deliver route=%s delivery=%s status=%s",
+                            route_name, delivery_id, response.status)
+                return
+            coalesce = route_config.get("coalesce")
+            if isinstance(coalesce, dict) and self._coalescer.enqueue(
+                    route_name=route_name, coalesce=coalesce, payload=payload, event_type=event_type,
+                    prompt=prompt, delivery_id=delivery_id, now=now, route_config=route_config,
+                    profile=profile):
+                logger.info("[webhook] script-route coalesced route=%s delivery=%s", route_name,
+                            delivery_id)
+                return
+            outcome = await self._admit_agent_run(payload, prompt, delivery_id, now,
+                                                  route_config=route_config, route_name=route_name,
+                                                  profile=profile, event_type=event_type)
+            if outcome is None:
+                logger.error("[webhook] Script-route delivery %s on route %s was not admitted",
+                             delivery_id, route_name)
+            elif outcome == "duplicate":
+                logger.info("[webhook] Script-route duplicate delivery %s on route %s", delivery_id,
+                            route_name)
+            else:
+                logger.info("[webhook] Script-route accepted event=%s route=%s delivery=%s", event_type,
+                            route_name, delivery_id)
+        except asyncio.CancelledError:
+            raise
+        except subprocess.TimeoutExpired as exc:
+            logger.warning("[webhook] script timed out route=%s delivery=%s: %s", route_name,
+                           delivery_id, exc)
+        except Exception:
+            logger.exception("[webhook] script-route background failed route=%s delivery=%s", route_name,
+                             delivery_id)
 
     async def _dispatch_agent_run(self, request, route_config: dict, route_name: str, profile, payload: Any, prompt: str,
                             event_type: str, delivery_id: str, now: float) -> web.Response:
